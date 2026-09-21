@@ -1,13 +1,25 @@
 #!/bin/sh
 set -e
 
-# 检查是否以 root 身份运行
+# ==========================================
+# mytv PHP 版一键部署脚本
+# 支持系统：Debian / Ubuntu / Alpine Linux
+#
+# 可选环境变量：
+#   MYTV_REF        拉取的文件版本（分支 / 标签 / commit），默认 main。
+#                   建议固定到 tag 或 commit 以保证部署结果可复现，例如：
+#                   MYTV_REF=v1.0.0 sh install.sh
+#   SHA_NGINX_CONF  php-site.conf 的 sha256（可选，设置后强制校验）
+#   SHA_MYTV_PHP    mytv.php 的 sha256（可选）
+#   SHA_SUB_PHP     sub.php 的 sha256（可选）
+# ==========================================
+
+# ========== 基础检查 ==========
 if [ "$(id -u)" -ne 0 ]; then
   echo "❌ 请以 root 身份运行此脚本，例如: sudo sh install.sh"
   exit 1
 fi
 
-# 获取操作系统信息
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS=$ID
@@ -18,31 +30,423 @@ fi
 
 echo "========================================="
 echo "   🚀 开始安装 Nginx 和 PHP-FPM 环境"
-echo "   💻 检测到系统: $OS"
+echo "   💻 检测到系统: ${OS:-未知}"
 echo "========================================="
 
-# 定义远程文件 URL
-NGINX_CONF_URL="https://raw.githubusercontent.com/HasonHuang/mytv/refs/heads/main/php/nginx/php-site.conf"
-MYTV_PHP_URL="https://raw.githubusercontent.com/rad168/mytv/refs/heads/main/php/mytv.php"
-SUB_PHP_URL="https://raw.githubusercontent.com/HasonHuang/mytv/refs/heads/main/php/sub.php"
-WEB_DIR="/var/www/html"
+# ========== 可配置项 ==========
+MYTV_REF="${MYTV_REF:-main}"
+REPO_RAW="https://raw.githubusercontent.com/HasonHuang/mytv/${MYTV_REF}"
 
-# 通用函数：自动探测 PHP-FPM Socket 并修正 Nginx 配置
-fix_nginx_socket() {
-    CONF_FILE=$1
-    echo "🔍 正在探测 PHP-FPM Socket 路径..."
-    # 在 /run 和 /var/run 下寻找 php 相关的 sock 文件
-    SOCK_PATH=$(find /run /var/run -name "*.sock" 2>/dev/null | grep -i php | head -n 1)
-    
-    if [ -n "$SOCK_PATH" ] && [ -f "$CONF_FILE" ]; then
-        echo "✅ 发现 Socket: $SOCK_PATH"
-        # 转义路径中的斜杠以便 sed 使用
-        ESCAPED_SOCK=$(echo "$SOCK_PATH" | sed 's/\//\\\//g')
-        # 替换配置文件中的 fastcgi_pass 行
-        sed -i "s/fastcgi_pass.*/fastcgi_pass unix:$ESCAPED_SOCK;/" "$CONF_FILE"
-        echo "🛠️ 已自动更新 Nginx 配置中的 fastcgi_pass 路径。"
+NGINX_CONF_URL_DEBIAN="${REPO_RAW}/nginx/debian/php-site.conf"
+NGINX_CONF_URL_ALPINE="${REPO_RAW}/nginx/alpine/php-site.conf"
+MYTV_PHP_URL="${REPO_RAW}/php/mytv.php"
+SUB_PHP_URL="${REPO_RAW}/php/sub.php"
+
+# PHP-FPM 监听地址（含 PHP 版本号）由本脚本写入该文件，
+# 站点配置只负责 include 它，因此下载下来的站点配置永远不需要被改写。
+FPM_CONF="/etc/nginx/mytv-fpm.conf"
+
+SHA_NGINX_CONF="${SHA_NGINX_CONF:-}"
+SHA_MYTV_PHP="${SHA_MYTV_PHP:-}"
+SHA_SUB_PHP="${SHA_SUB_PHP:-}"
+
+WEB_DIR="/var/www/html"
+PHP_VERSION=""
+
+# ========== 通用函数 ==========
+
+# 下载文件（带重试、非空校验、可选 sha256 校验），先写临时文件再原子替换
+# fetch <url> <目标文件> <sha256|空> <php|conf>
+fetch() {
+    url=$1
+    dest=$2
+    want_sha=$3
+    kind=$4
+
+    # 中间文件写在与目标相同的目录（保证 mv 是原地重命名），但名字以 "." 开头：
+    # 万一脚本被 Ctrl-C / kill 打断，也不会在网站根目录留下
+    # mytv.php.tmp.<pid> 这种可被当作静态文件下载的残留。
+    # 站点配置里另有隐藏文件拒绝规则兜底。
+    tmp="$(dirname "$dest")/.$(basename "$dest").tmp.$$"
+    FETCH_TMP="$tmp"
+    trap 'rm -f "$FETCH_TMP"' EXIT
+    trap 'rm -f "$FETCH_TMP"; exit 130' HUP INT TERM
+
+    if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        echo "❌ 下载失败: $url"
+        echo "   请检查网络连通性，并确认 MYTV_REF='$MYTV_REF' 下该文件是否存在。"
+        exit 1
+    fi
+
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo "❌ 下载内容为空: $url"
+        exit 1
+    fi
+
+    # 粗略的内容校验：防止下载到错误页面 / 被劫持的内容
+    if [ "$kind" = "php" ] && ! head -c 5 "$tmp" | grep -q '<?php'; then
+        rm -f "$tmp"
+        echo "❌ 下载到的内容不是 PHP 文件: $url"
+        exit 1
+    fi
+
+    if [ -n "$want_sha" ]; then
+        got=$(sha256sum "$tmp" | awk '{print $1}')
+        if [ "$got" != "$want_sha" ]; then
+            rm -f "$tmp"
+            echo "❌ sha256 校验失败: $url"
+            echo "   期望: $want_sha"
+            echo "   实际: $got"
+            exit 1
+        fi
+    fi
+
+    mv -f "$tmp" "$dest"
+}
+
+# 启动服务（并尽量设置开机自启），成功返回 0
+start_service() {
+    svc=$1
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl enable --now "$svc"
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-update add "$svc" default >/dev/null 2>&1 || true
+        rc-service "$svc" start
+    elif command -v service >/dev/null 2>&1; then
+        service "$svc" start
     else
-        echo "⚠️ 未自动探测到 PHP-FPM Socket，请手动检查 Nginx 配置中的 fastcgi_pass 设置。"
+        return 1
+    fi
+}
+
+# 重新加载 Nginx
+reload_nginx() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        systemctl reload nginx
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service nginx reload 2>/dev/null || rc-service nginx restart
+    elif command -v service >/dev/null 2>&1; then
+        service nginx reload
+    else
+        nginx -s reload
+    fi
+}
+
+# 探测已安装的 PHP 主次版本号（如 8.4），失败返回 1
+detect_php_version() {
+    # 1) Debian / Ubuntu：以「实际装了的 php*-fpm 包」为准。
+    #    不能优先用 php CLI 的版本：本机可能早就装着 php8.2-cli（例如装过
+    #    composer），而脚本刚装的是 php8.4-fpm，两者不一致时脚本会去启动一个
+    #    根本不存在的 php8.2-fpm 服务然后中途失败；就算 8.2-fpm 恰好也在，
+    #    站点也会被绑到旧版本的 socket 上。Alpine 没有 dpkg，会直接落到第 2 步。
+    v=$(dpkg-query -W -f='${Package}\n' 'php*-fpm' 2>/dev/null \
+        | sed -n 's/^php\([0-9][0-9.]*\)-fpm$/\1/p' \
+        | sort -V | tail -n 1 || true)
+    if [ -n "$v" ]; then
+        printf '%s\n' "$v"
+        return 0
+    fi
+
+    # 2) PHP CLI（Alpine 会安装 php CLI，其版本与 php-fpm 一致）
+    v=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)
+    if [ -n "$v" ]; then
+        printf '%s\n' "$v"
+        return 0
+    fi
+
+    # 3) Alpine：从 /etc/php83 这类目录名推断（php83 -> 8.3，php810 -> 8.10）
+    d=$(ls -d /etc/php[0-9]* 2>/dev/null | sort -V | tail -n 1 || true)
+    if [ -n "$d" ]; then
+        n=${d#/etc/php}
+        printf '%s.%s\n' "$(printf '%s' "$n" | cut -c1)" "$(printf '%s' "$n" | cut -c2-)"
+        return 0
+    fi
+
+    return 1
+}
+
+# 读取 php-fpm 池配置中的所有 listen 指令（每行一个，已排序去重）
+read_pool_listens() {
+    # shellcheck disable=SC2086  # 这里需要通配符展开
+    files=$(ls $1 2>/dev/null | sort || true)
+    if [ -z "$files" ]; then
+        return 0
+    fi
+    # shellcheck disable=SC2086
+    grep -hs '^[[:space:]]*listen[[:space:]]*=' $files 2>/dev/null \
+        | sed 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*//; s/;.*$//; s/[[:space:]]*$//' \
+        | sort -u
+}
+
+# 校验监听目标是否真的可用，成功则输出 nginx 可用的 fastcgi_pass 目标
+# 输入形如 /run/php/php8.4-fpm.sock 或 127.0.0.1:9000
+verify_listen() {
+    target=$1
+    case "$target" in
+        /*)
+            if [ -S "$target" ]; then
+                printf 'unix:%s\n' "$target"
+                return 0
+            fi
+            ;;
+        *:*)
+            host=${target%:*}
+            # 用 ## 贪婪匹配，兼容 [::]:9000 这类 IPv6 写法
+            port=${target##*:}
+            case "$host" in
+                ""|"0.0.0.0"|"[::]"|"::"|"*") host="127.0.0.1" ;;
+            esac
+            if command -v ss >/dev/null 2>&1; then
+                if ss -ltn 2>/dev/null | grep -q "[:.]${port}[[:space:]]"; then
+                    printf '%s\n' "$host:$port"
+                    return 0
+                fi
+            elif command -v netstat >/dev/null 2>&1; then
+                if netstat -ltn 2>/dev/null | grep -q "[:.]${port}[[:space:]]"; then
+                    printf '%s\n' "$host:$port"
+                    return 0
+                fi
+            else
+                # 无法校验端口占用情况，按配置直接采用
+                printf '%s\n' "$host:$port"
+                return 0
+            fi
+            ;;
+    esac
+    return 1
+}
+
+# 兜底：直接扫描系统中已存在的 php-fpm unix socket
+find_fpm_sock() {
+    php_ver=$1
+    candidates=$(find /run /var/run -maxdepth 3 -name '*.sock' 2>/dev/null | grep -i php | sort -u || true)
+    if [ -z "$candidates" ]; then
+        return 1
+    fi
+    if [ -n "$php_ver" ]; then
+        match=$(printf '%s\n' "$candidates" | grep -F "$php_ver" | head -n 1 || true)
+        if [ -n "$match" ]; then
+            printf '%s\n' "$match"
+            return 0
+        fi
+    fi
+    printf '%s\n' "$candidates" | head -n 1
+}
+
+# 解析 php-fpm 的实际监听地址，输出 nginx 的 fastcgi_pass 目标；失败返回 1
+resolve_fastcgi_target() {
+    php_ver=$1
+    alt_ver=$(printf '%s' "$php_ver" | tr -d '.')
+
+    # 1) 优先读取 php-fpm 池配置里的 listen（最准确，且同时覆盖 unix socket 与 TCP）；
+    #    池目录中可能有多个池，取第一个当前真实可用的。
+    for pool_glob in \
+        "/etc/php/$php_ver/fpm/pool.d/*.conf" \
+        "/etc/php${alt_ver}/php-fpm.d/*.conf" \
+        "/etc/php*/php-fpm.d/*.conf" \
+        "/etc/php/*/fpm/pool.d/*.conf"
+    do
+        listens=$(read_pool_listens "$pool_glob")
+        for listen in $listens; do
+            t=$(verify_listen "$listen" || true)
+            if [ -n "$t" ]; then
+                printf '%s\n' "$t"
+                return 0
+            fi
+        done
+    done
+
+    # 2) 退而求其次：扫描实际存在的 unix socket
+    sock=$(find_fpm_sock "$php_ver" || true)
+    if [ -n "$sock" ]; then
+        printf 'unix:%s\n' "$sock"
+        return 0
+    fi
+
+    # 3) 最后兜底：常见的 TCP 监听
+    t=$(verify_listen "127.0.0.1:9000" || true)
+    if [ -n "$t" ]; then
+        printf '%s\n' "$t"
+        return 0
+    fi
+
+    return 1
+}
+
+# 探测 PHP-FPM 监听地址并写入独立的一行地址文件；站点配置只 include 该文件，
+# 因此下载下来的 php-site.conf 永远不需要被改写。
+write_fpm_address() {
+    echo "🔍 正在探测 PHP-FPM 监听地址..."
+    target=$(resolve_fastcgi_target "$PHP_VERSION" || true)
+    if [ -z "$target" ]; then
+        echo "❌ 无法确定 PHP-FPM 的监听地址，安装中止。"
+        echo "   请手动确认 PHP-FPM 是否已启动，例如："
+        echo "     ss -ltnp | grep 9000"
+        echo "     ls -l /run/php/*.sock /run/*.sock 2>/dev/null"
+        exit 1
+    fi
+
+    mkdir -p "$(dirname "$FPM_CONF")"
+    printf 'fastcgi_pass %s;\n' "$target" > "$FPM_CONF"
+    echo "✅ 已写入 $FPM_CONF -> fastcgi_pass $target"
+}
+
+# 下载站点配置、写入 PHP-FPM 地址文件、校验配置；校验失败则回滚并退出
+# install_site_conf <配置 URL> <目标目录>
+install_site_conf() {
+    conf_url=$1
+    conf_dir=$2
+    conf_file="$conf_dir/php-site.conf"
+    stamp=$(date +%Y%m%d%H%M%S)
+
+    mkdir -p "$conf_dir"
+
+    if [ -f "$conf_file" ]; then
+        cp "$conf_file" "$conf_file.bak.$stamp"
+        echo "ℹ️ 已备份原有配置到 $conf_file.bak.$stamp"
+    fi
+
+    # 顺序很重要：先探测地址、写好 mytv-fpm.conf，再覆盖站点配置。
+    # 这两步中任何一步失败都会 exit，而此时旧的 php-site.conf 还完好无损；
+    # 反过来（先覆盖站点配置）一旦探测失败就直接退出，下面的回滚分支永远
+    # 执行不到，磁盘上会留下一个 include 了不存在文件的 php-site.conf ——
+    # 此后 nginx -t / reload 全部失败，重启后 nginx 直接起不来，
+    # 同机 conf.d 里其它站点会一起下线。
+    write_fpm_address
+
+    fetch "$conf_url" "$conf_file" "$SHA_NGINX_CONF" conf
+
+    if ! nginx -t; then
+        if [ -f "$conf_file.bak.$stamp" ]; then
+            cp "$conf_file.bak.$stamp" "$conf_file"
+            echo "↩️ Nginx 配置校验失败，已回滚到原有配置。"
+        else
+            rm -f "$conf_file"
+            echo "↩️ Nginx 配置校验失败，已移除新写入的配置。"
+        fi
+        exit 1
+    fi
+    echo "✅ Nginx 配置校验通过"
+}
+
+# 部署 PHP 文件并做端到端自检
+# setup_site <配置 URL> <目标目录> <网站属主>
+setup_site() {
+    conf_url=$1
+    conf_dir=$2
+    web_owner=$3
+
+    echo "[3/5] 配置 Nginx 站点..."
+    install_site_conf "$conf_url" "$conf_dir"
+    reload_nginx
+
+    echo "[4/5] 部署 PHP 文件到 $WEB_DIR ..."
+    mkdir -p "$WEB_DIR"
+    # 清理历史遗留的下载中间文件（旧版本把它们写在网站根目录且不带前导点，
+    # 会被 nginx 当作静态文件公开，这里顺手擦掉）
+    rm -f "$WEB_DIR"/.mytv.php.tmp.* "$WEB_DIR"/.sub.php.tmp.* \
+          "$WEB_DIR"/mytv.php.tmp.* "$WEB_DIR"/sub.php.tmp.* 2>/dev/null || true
+    fetch "$MYTV_PHP_URL" "$WEB_DIR/mytv.php" "$SHA_MYTV_PHP" php
+    fetch "$SUB_PHP_URL" "$WEB_DIR/sub.php" "$SHA_SUB_PHP" php
+    # nginx 与 php-fpm 只需要读取权限，因此只授权这两个文件，
+    # 避免影响该目录下其它站点已有的属主与权限。
+    chmod 644 "$WEB_DIR/mytv.php" "$WEB_DIR/sub.php"
+    chown "$web_owner:$web_owner" "$WEB_DIR/mytv.php" "$WEB_DIR/sub.php"
+
+    echo "[5/5] 站点自检..."
+    verify_site
+}
+
+# 通过本机请求确认站点真的可用，避免"脚本报成功、实际 502"
+verify_site() {
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1/mytv.php" || true)
+    case "$code" in
+        200)
+            echo "✅ 站点自检通过 (HTTP 200)"
+            ;;
+        502|504)
+            echo "❌ 站点返回 HTTP $code：Nginx 无法连接 PHP-FPM。"
+            echo "   请对比配置中的 fastcgi_pass 与 'ss -ltnp | grep -E \"sock|9000\"' 的实际监听地址。"
+            exit 1
+            ;;
+        403|404)
+            echo "❌ 站点返回 HTTP $code：/mytv.php 不可访问。"
+            echo "   请检查 $WEB_DIR/mytv.php 是否存在，以及 nginx 配置中的 root 是否一致。"
+            exit 1
+            ;;
+        000|"")
+            echo "❌ 无法访问 http://127.0.0.1/mytv.php。"
+            echo "   请检查 80 端口是否被占用（ss -ltnp | grep :80）、防火墙是否放行 80 端口。"
+            if [ "$OS" = "alpine" ]; then
+                echo "   若你用过仓库里的 nginx/alpine/nginx.conf，请确认 /etc/nginx/nginx.conf 中"
+                echo "     include /etc/nginx/http.d/*.conf;"
+                echo "   这行没有被注释掉——仓库那份默认是注释状态，取消注释后http.d 下的"
+                echo "   站点配置才会被加载（否则 nginx -t 通过但 80 端口无人监听）。"
+            fi
+            exit 1
+            ;;
+        *)
+            echo "⚠️ 站点返回 HTTP $code，请手动访问 http://<服务器IP>/mytv.php 确认。"
+            ;;
+    esac
+}
+
+# 读取物理内存总量（MB）；读不到则输出空
+detect_mem_mb() {
+    [ -r /proc/meminfo ] || return 1
+    awk '/^MemTotal:/ { printf "%d\n", $2 / 1024; exit }' /proc/meminfo 2>/dev/null
+}
+
+# 小内存机器提示：PHP 默认 memory_limit = 128M、php-fpm 默认 pm.max_children = 5，
+# 两者相乘允许的 PHP 堆远超 64/128MB 机器的物理内存；而 mytv.php 会把整个 .ts
+# 分片读进内存（CURLOPT_RETURNTRANSFER），几个并发播放就会被 OOM killer 杀掉
+# php-fpm 子进程，表现为整站 502。这里只打印可直接执行的命令，不擅自改系统配置。
+advise_low_mem() {
+    mem_mb=$(detect_mem_mb || true)
+    case "$mem_mb" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    [ "$mem_mb" -lt 512 ] || return 0
+
+    if [ "$mem_mb" -lt 128 ]; then
+        children=1
+        mem_limit=32M
+    else
+        children=2
+        mem_limit=64M
+    fi
+
+    if [ "$OS" = "alpine" ]; then
+        pool_dir="/etc/php$(printf '%s' "$PHP_VERSION" | tr -d '.')/php-fpm.d"
+        fpm_restart="rc-service ${PHP_FPM_SVC:-php-fpm} restart"
+    else
+        pool_dir="/etc/php/${PHP_VERSION}/fpm/pool.d"
+        fpm_restart="systemctl restart php${PHP_VERSION}-fpm"
+    fi
+
+    echo
+    echo "⚠️ 检测到物理内存仅 ${mem_mb}MB，建议收紧 PHP-FPM 配置："
+    echo "   mytv.php 会把整个 .ts 分片读进内存，而 PHP 默认 memory_limit=128M、"
+    echo "   php-fpm 默认 pm.max_children=5，合计上限远超本机内存，"
+    echo "   几个并发播放就会 OOM，表现为整站 502。"
+    echo
+    echo "   路径已按本机填好，整段复制执行即可："
+    echo
+    printf '%s\n' \
+"cat > $pool_dir/zz-mytv.conf <<'EOF'" \
+"pm = ondemand" \
+"pm.max_children = $children" \
+"pm.process_idle_timeout = 30s" \
+"pm.max_requests = 200" \
+"php_admin_value[memory_limit] = $mem_limit" \
+"EOF" \
+"$fpm_restart"
+    echo
+    if [ "$mem_mb" -lt 128 ]; then
+        echo "   ℹ️ ${mem_mb}MB 内存跑 PHP 版非常勉强，只适合自用（并发基本串行）；"
+        echo "      要给多人稳定服务，建议 256MB 以上内存。"
     fi
 }
 
@@ -51,82 +455,74 @@ fix_nginx_socket() {
 # ==========================================
 install_debian() {
     export DEBIAN_FRONTEND=noninteractive
-    
-    echo "[1/4] 安装 Nginx 和 基础工具..."
+
+    echo "[1/5] 安装 Nginx 和 基础工具..."
     apt-get update
     apt-get install -y nginx curl
 
-    echo "[2/4] 安装 PHP 和 PHP-FPM..."
+    echo "[2/5] 安装 PHP 和 PHP-FPM..."
     if ! apt-get install -y php8.4-fpm php8.4-curl; then
         echo "⚠️ 未找到 php8.4，尝试安装系统默认版本的 php-fpm..."
         apt-get install -y php-fpm php-curl
     fi
 
-    systemctl enable --now nginx
+    PHP_VERSION=$(detect_php_version || true)
+    if [ -z "$PHP_VERSION" ]; then
+        echo "❌ 未能识别已安装的 PHP 版本，请确认 php-fpm 是否安装成功。"
+        exit 1
+    fi
+    echo "ℹ️ 检测到 PHP 版本: $PHP_VERSION"
+
+    if ! start_service "php${PHP_VERSION}-fpm"; then
+        echo "❌ 启动 php${PHP_VERSION}-fpm 失败，请执行 'systemctl status php${PHP_VERSION}-fpm' 查看原因。"
+        exit 1
+    fi
+
+    if ! start_service nginx; then
+        echo "❌ 启动 Nginx 失败，请检查 80 端口是否被其它服务占用（ss -ltnp | grep :80）。"
+        exit 1
+    fi
+
+    # 该文件是指向 sites-available/default 的软链接，删除后如需恢复可重新 ln -s
     rm -f /etc/nginx/sites-enabled/default
 
-    # 获取 PHP 版本以启动对应服务
-    PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;" 2>/dev/null || echo "")
-    if [ -z "$PHP_VERSION" ]; then
-        PHP_VERSION=$(dpkg -l 2>/dev/null | grep "php[0-9.]*-fpm" | awk '{print $2}' | head -n 1 | sed 's/^php//;s/-fpm$//')
-    fi
-    [ -z "$PHP_VERSION" ] && PHP_VERSION="8.4" # 兜底
-
-    systemctl enable --now "php${PHP_VERSION}-fpm"
-
-    echo "[3/4] 配置 Nginx 站点..."
-    mkdir -p /etc/nginx/conf.d
-    curl -fsSL "$NGINX_CONF_URL" -o /etc/nginx/conf.d/php-site.conf
-    
-    # 修正 Socket 路径
-    fix_nginx_socket "/etc/nginx/conf.d/php-site.conf"
-
-    nginx -t && systemctl reload nginx
-
-    echo "[4/4] 部署 PHP 文件..."
-    mkdir -p "$WEB_DIR"
-    curl -fsSL "$MYTV_PHP_URL" -o "$WEB_DIR/mytv.php"
-    curl -fsSL "$SUB_PHP_URL" -o "$WEB_DIR/sub.php"
-    chown -R www-data:www-data "$WEB_DIR"
+    setup_site "$NGINX_CONF_URL_DEBIAN" "/etc/nginx/conf.d" "www-data"
 }
 
 # ==========================================
 # Alpine Linux 安装逻辑
 # ==========================================
 install_alpine() {
-    echo "[1/4] 安装 Nginx, PHP 和 基础工具..."
+    echo "[1/5] 安装 Nginx, PHP 和 基础工具..."
     apk update
     apk add --no-cache nginx php php-fpm php-curl curl
 
-    # 启动 Nginx
-    rc-update add nginx default >/dev/null 2>&1
-    rc-service nginx start
-    # 删除 Alpine 默认的 default 站点
+    echo "[2/5] 启动 Nginx 和 PHP-FPM..."
+    if ! start_service nginx; then
+        echo "❌ 启动 Nginx 失败，请检查 80 端口是否被其它服务占用。"
+        exit 1
+    fi
+    # Alpine 默认站点使用 /var/www/localhost/htdocs，且会以 default_server 抢占 80 端口
     rm -f /etc/nginx/http.d/default.conf
 
-    echo "[2/4] 启动 PHP-FPM..."
-    # 动态获取 Alpine 下的 php-fpm 服务名 (可能是 php-fpm 或 php-fpm83 等)
-    PHP_FPM_SVC=$(ls /etc/init.d/php-fpm* 2>/dev/null | head -n 1 | awk -F'/' '{print $NF}')
+    PHP_VERSION=$(detect_php_version || true)
+    if [ -z "$PHP_VERSION" ]; then
+        echo "❌ 未能识别已安装的 PHP 版本，请确认 php-fpm 是否安装成功。"
+        exit 1
+    fi
+    echo "ℹ️ 检测到 PHP 版本: $PHP_VERSION"
+
+    # 动态获取 Alpine 下的 php-fpm 服务名（可能是 php-fpm 或 php-fpm83 等）
+    PHP_FPM_SVC=$(ls /etc/init.d/php-fpm* 2>/dev/null | head -n 1 | awk -F'/' '{print $NF}' || true)
     if [ -z "$PHP_FPM_SVC" ]; then PHP_FPM_SVC="php-fpm"; fi
 
-    rc-update add "$PHP_FPM_SVC" default >/dev/null 2>&1
-    rc-service "$PHP_FPM_SVC" start
+    if ! start_service "$PHP_FPM_SVC"; then
+        echo "❌ 启动 $PHP_FPM_SVC 失败，请执行 'rc-service $PHP_FPM_SVC status' 查看原因。"
+        exit 1
+    fi
 
-    echo "[3/4] 配置 Nginx 站点..."
-    # Alpine 默认 include 的是 /etc/nginx/http.d/ 目录
-    curl -fsSL "$NGINX_CONF_URL" -o /etc/nginx/http.d/php-site.conf
-    
-    # 修正 Socket 路径 (Alpine 的 socket 路径与 Debian 不同，这一步至关重要)
-    fix_nginx_socket "/etc/nginx/http.d/php-site.conf"
-
-    nginx -t && nginx -s reload
-
-    echo "[4/4] 部署 PHP 文件..."
-    mkdir -p "$WEB_DIR"
-    curl -fsSL "$MYTV_PHP_URL" -o "$WEB_DIR/mytv.php"
-    curl -fsSL "$SUB_PHP_URL" -o "$WEB_DIR/sub.php"
-    # Alpine 的 nginx 默认用户通常是 nginx
-    chown -R nginx:nginx "$WEB_DIR"
+    # Alpine 的 nginx 站点配置目录是 /etc/nginx/http.d
+    setup_site "$NGINX_CONF_URL_ALPINE" "/etc/nginx/http.d" "nginx"
 }
 
 # ==========================================
@@ -140,7 +536,7 @@ case "$OS" in
         install_alpine
         ;;
     *)
-        echo "❌ 暂不支持的操作系统: $OS"
+        echo "❌ 暂不支持的操作系统: ${OS:-未知}"
         echo "目前仅支持 Debian, Ubuntu 和 Alpine Linux。"
         exit 1
         ;;
@@ -151,3 +547,11 @@ echo "   🎉 安装完成！"
 echo "========================================="
 echo "👉 请访问 http://<你的服务器IP>/mytv.php 进行测试。"
 echo "📁 网站根目录: $WEB_DIR"
+advise_low_mem
+if command -v ufw >/dev/null 2>&1; then
+    echo "💡 若外部无法访问，请放行端口: ufw allow 80/tcp"
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    echo "💡 若外部无法访问，请放行端口: firewall-cmd --add-service=http --permanent && firewall-cmd --reload"
+fi
+echo "⚠️ 注意：mytv.php 可代理任意 url 参数，默认对访问者完全开放（存在被当作开放代理/SSRF 利用的风险）。"
+echo "   若服务器暴露在公网，建议在 php-site.conf 的 php 解析块中启用 allow/deny 访问控制。"
