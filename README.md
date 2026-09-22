@@ -149,6 +149,7 @@ PHP 版的瓶颈不在 nginx，而在 PHP：`mytv.php` 会把整个 `.ts` 分片
 
 ```
 cat > /etc/php/8.4/fpm/pool.d/zz-mytv.conf <<'EOF'
+[www]
 pm = ondemand
 pm.max_children = 2
 pm.process_idle_timeout = 30s

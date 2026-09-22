@@ -399,55 +399,64 @@ detect_mem_mb() {
     awk '/^MemTotal:/ { printf "%d\n", $2 / 1024; exit }' /proc/meminfo 2>/dev/null
 }
 
-# 小内存机器提示：PHP 默认 memory_limit = 128M、php-fpm 默认 pm.max_children = 5，
-# 两者相乘允许的 PHP 堆远超 64/128MB 机器的物理内存；而 mytv.php 会把整个 .ts
-# 分片读进内存（CURLOPT_RETURNTRANSFER），几个并发播放就会被 OOM killer 杀掉
-# php-fpm 子进程，表现为整站 502。这里只打印可直接执行的命令，不擅自改系统配置。
-advise_low_mem() {
+# 高配机器提示：站点配置的出厂值按 64/128MB 小内存机定值（超时 60s、
+# memory_limit 64M），内存充裕的机器反而需要放宽，否则并发数和单个分片的
+# 大小上限都会被按住。这里只打印可直接执行的命令，不擅自改系统配置。
+advise_high_mem() {
     mem_mb=$(detect_mem_mb || true)
     case "$mem_mb" in
         ''|*[!0-9]*) return 0 ;;
     esac
-    [ "$mem_mb" -lt 512 ] || return 0
+    # 1GB 以下沿用低配出厂值，不打扰用户
+    [ "$mem_mb" -ge 1024 ] || return 0
 
-    if [ "$mem_mb" -lt 128 ]; then
-        children=1
-        mem_limit=32M
+    if [ "$mem_mb" -ge 4096 ]; then
+        children=20
+        mem_limit=256M
     else
-        children=2
-        mem_limit=64M
+        children=8
+        mem_limit=128M
     fi
 
     if [ "$OS" = "alpine" ]; then
         pool_dir="/etc/php$(printf '%s' "$PHP_VERSION" | tr -d '.')/php-fpm.d"
+        site_conf="/etc/nginx/http.d/php-site.conf"
         fpm_restart="rc-service ${PHP_FPM_SVC:-php-fpm} restart"
+        nginx_reload="rc-service nginx reload"
     else
         pool_dir="/etc/php/${PHP_VERSION}/fpm/pool.d"
+        site_conf="/etc/nginx/conf.d/php-site.conf"
         fpm_restart="systemctl restart php${PHP_VERSION}-fpm"
+        nginx_reload="systemctl reload nginx"
     fi
 
     echo
-    echo "⚠️ 检测到物理内存仅 ${mem_mb}MB，建议收紧 PHP-FPM 配置："
-    echo "   mytv.php 会把整个 .ts 分片读进内存，而 PHP 默认 memory_limit=128M、"
-    echo "   php-fpm 默认 pm.max_children=5，合计上限远超本机内存，"
-    echo "   几个并发播放就会 OOM，表现为整站 502。"
+    echo "ℹ️ 检测到物理内存 ${mem_mb}MB：站点配置是按需 64/128MB 小内存机定的"
+    echo "   （超时 60s、单请求 memory_limit 64M），你这台可以放宽。"
     echo
-    echo "   路径已按本机填好，整段复制执行即可："
+    echo "   下面两段已按本机填好路径，各自整段复制执行即可；不动也能用，"
+    echo "   只是并发数和分片大小上限受限："
+    echo
+    echo "   ① 放宽 PHP-FPM（$children 个 worker，每个最多 $mem_limit）："
     echo
     printf '%s\n' \
 "cat > $pool_dir/zz-mytv.conf <<'EOF'" \
-"pm = ondemand" \
+"[www]" \
 "pm.max_children = $children" \
-"pm.process_idle_timeout = 30s" \
-"pm.max_requests = 200" \
+"pm.max_requests = 500" \
 "php_admin_value[memory_limit] = $mem_limit" \
 "EOF" \
 "$fpm_restart"
     echo
-    if [ "$mem_mb" -lt 128 ]; then
-        echo "   ℹ️ ${mem_mb}MB 内存跑 PHP 版非常勉强，只适合自用（并发基本串行）；"
-        echo "      要给多人稳定服务，建议 256MB 以上内存。"
-    fi
+    echo "   ② 放宽 nginx 超时（分片要整段下完才吐第一个字节，慢源站需要更宽松）："
+    echo
+    printf '%s\n' \
+"sed -i -E 's/^([[:space:]]*(fastcgi_read_timeout|fastcgi_send_timeout|send_timeout))[[:space:]]+60s;/\1 120s;/' $site_conf" \
+"nginx -t && $nginx_reload"
+    echo
+    echo "   说明：①里的 php_admin_value 优先级高于站点配置里的 PHP_ADMIN_VALUE，"
+    echo "   两处 memory_limit 以池配置为准；②若你用的是 php-site-manual.conf 或"
+    echo "   改过站点配置路径，请把文件名换成实际路径。"
 }
 
 # ==========================================
@@ -547,7 +556,7 @@ echo "   🎉 安装完成！"
 echo "========================================="
 echo "👉 请访问 http://<你的服务器IP>/mytv.php 进行测试。"
 echo "📁 网站根目录: $WEB_DIR"
-advise_low_mem
+advise_high_mem
 if command -v ufw >/dev/null 2>&1; then
     echo "💡 若外部无法访问，请放行端口: ufw allow 80/tcp"
 elif command -v firewall-cmd >/dev/null 2>&1; then
