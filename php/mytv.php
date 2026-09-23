@@ -17,7 +17,31 @@ if ($p === 'm3u') {
 
 $m3uurl = "https://cdn.qd.je/mytv0.m3u";
 
-$m3u = file_get_contents($m3uurl);
+// === 使用 cURL 彻底解决超时和拦截问题 ===
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, $m3uurl);
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4); // 强制使用 IPv4
+curl_setopt($ch, CURLOPT_TIMEOUT, 10); // 10 秒超时，快速失败
+curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'); // 伪装浏览器
+
+$m3u = curl_exec($ch);
+$curl_error = curl_error($ch);
+$curl_errno = curl_errno($ch); // 获取 cURL 错误号
+curl_close($ch);
+
+// 如果抓取失败，返回 503 状态码
+if ($m3u === false || $curl_errno !== 0) {
+    // 使用 PHP 内置函数设置 HTTP 状态码为 503
+    http_response_code(503); 
+    
+    // 可选：告诉客户端或 CDN 在 60 秒后重试（对 503 状态码的良好实践）
+    // header("Retry-After: 60"); 
+    
+    die("M3U Fetch Error (503): " . $curl_error);
+}
 
 $m3u = preg_replace(
     '#http://[^/]+/mytv\.php#',
