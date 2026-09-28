@@ -190,10 +190,24 @@ gen_token() {
     printf '%s\n' "$t"
 }
 
-# 探测 php-fpm 的运行组名。
-# 必须在覆盖 mytv.php 属主之前调用：主安装器刚把它 chown 成 web 属主，
-# 那正是"PHP 以哪个用户跑"的权威答案；等我们改成 root:root 之后就问不出来了。
+# 探测 php-fpm 实际以哪个组运行（决定 /etc/mytv 的属组，读不到就是整站 503）。
 detect_php_group() {
+    # 1) php-fpm 池配置里的 group 指令 —— 唯一"PHP 进程真的以谁的身份跑"的权威答案。
+    #    不能拿 mytv.php 的属主组来推断：那是 **nginx** 的属主，两个发行版并不一致。
+    #    Debian 上恰好都是 www-data，所以旧写法看着没问题；Alpine 上 Web 属主是
+    #    nginx，而 php-fpm 池配的是 user = nobody，照抄就成了 root:nginx 0710，
+    #    php-fpm 读不到 tokens.php，裸访问返回 503。
+    g=$(grep -hs '^[[:space:]]*group[[:space:]]*=' \
+            /etc/php/*/fpm/pool.d/*.conf /etc/php*/php-fpm.d/*.conf 2>/dev/null \
+        | sed 's/^[[:space:]]*group[[:space:]]*=[[:space:]]*//; s/;.*$//; s/[[:space:]]*$//' \
+        | grep -v '^root$' \
+        | head -n 1 || true)
+    if [ -n "$g" ] && grep -q "^$g:" /etc/group 2>/dev/null; then
+        printf '%s\n' "$g"
+        return 0
+    fi
+
+    # 2) 退一步：mytv.php 的属主组（池配置读不出来时才轮到它）
     if [ -f "$WEB_DIR/mytv.php" ]; then
         g=$(stat -c %G "$WEB_DIR/mytv.php" 2>/dev/null || true)
         # 排除 root：阶段 2 会把 mytv.php 改成 root:root，重跑时若照抄这个属主，
@@ -205,19 +219,9 @@ detect_php_group() {
         fi
     fi
 
-    # php-fpm 池配置里的 group 指令（最权威，且不受上面那种自我覆盖影响）
-    g=$(grep -hs '^[[:space:]]*group[[:space:]]*=' \
-            /etc/php/*/fpm/pool.d/*.conf /etc/php*/php-fpm.d/*.conf 2>/dev/null \
-        | sed 's/^[[:space:]]*group[[:space:]]*=[[:space:]]*//; s/;.*$//; s/[[:space:]]*$//' \
-        | grep -v '^root$' \
-        | head -n 1 || true)
-    if [ -n "$g" ] && grep -q "^$g:" /etc/group 2>/dev/null; then
-        printf '%s\n' "$g"
-        return 0
-    fi
-
+    # 3) 发行版默认值：Alpine 的 php-fpm 池用 nobody（不是 nginx——那是 web 的组）
     case "$OS" in
-        alpine) printf 'nginx\n' ;;
+        alpine) printf 'nobody\n' ;;
         *)      printf 'www-data\n' ;;
     esac
 }
@@ -295,7 +299,7 @@ fi
 echo
 echo "[2/2] 切换为 token 版"
 
-# 2.1 先探测 php 运行组（必须在 chown root:root 之前做，理由见函数注释）
+# 2.1 探测 php 运行组（读的是 php-fpm 池配置，与 mytv.php 属主无关）
 PHP_GROUP=$(detect_php_group)
 echo "ℹ️ PHP 运行组: $PHP_GROUP"
 

@@ -793,9 +793,18 @@ if ($SUB !== '') {
 
     // 是否播放列表：看内容有没有 #EXTM3U，或路径是不是 .m3u/.m3u8
     // （只看 path 而不是整个 URL：查询串里出现 ".m3u8" 不代表响应就是播放列表）
+    //
+    // 前提是上游真的成功了（2xx）：4xx/5xx 的正文是错误提示，不是播放列表。
+    // 面板拒绝订阅时正是回 401 + 纯文本 "unauthorized: invalid or expired token"，
+    // 而 sub 的 path 又恰好是 .m3u —— 不设这道闸，改写器会把错误提示当成
+    // "播放列表里的第 1 行链接"，按上游目录解析成
+    // https://面板/sub/<token>/unauthorized: invalid or expired token
+    // 再包装成本站代理链接发出去，客户端跟过去照样 401，用户看到的则是一个
+    // 莫名其妙的 ?url= 长链接，完全掩盖了"订阅已失效"这个真实原因。
     $sub_path_for_ext = parse_url($SUB, PHP_URL_PATH);
-    $sub_is_m3u = (stripos($response, '#EXTM3U') !== false)
-        || preg_match('/\.m3u8?$/i', is_string($sub_path_for_ext) ? $sub_path_for_ext : '');
+    $sub_is_m3u = ($sub_code >= 200 && $sub_code < 300)
+        && ((stripos($response, '#EXTM3U') !== false)
+            || preg_match('/\.m3u8?$/i', is_string($sub_path_for_ext) ? $sub_path_for_ext : ''));
 
     if ($sub_is_m3u) {
         $sub_base_root = $sub_scheme . '://' . $sub_host . ($sub_port ? ':' . $sub_port : '');

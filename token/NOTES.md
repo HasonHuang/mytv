@@ -149,6 +149,10 @@ header('Location: ' . $q, true, 302);
 | Debian / Ubuntu | `nginx`、`curl`、`php-fpm`（优先 `php8.4-fpm`）、`php-curl` |
 | Alpine | `nginx`、`php`、`php-fpm`、`php-curl`、`curl` |
 
+- Alpine 3.2x 起 nginx 的 OpenRC 服务脚本被拆进 `nginx-openrc` 子包（主包不再包含），
+  所以主安装器只在确实有 OpenRC 在跑时（`/run/openrc/softlevel` 存在）补装它；容器里
+  没有 init 系统，nginx / php-fpm 由脚本直接拉起（容器重启后不会自动恢复，重跑脚本即可，
+  脚本结束时会提示）
 - **不需要**：数据库、composer、node、redis、cron、`openssl` 命令行（token 用内核 UUID / `/dev/urandom` 生成）
 - **不需要 mbstring**：过滤用 `stripos`（二进制安全、中文正确），已在 Alpine php 8.3（`mbstring=0`）上验证
 - **需要 PHP ≥ 7.0**：代码只用 `??` 与 `catch (\Throwable)`
