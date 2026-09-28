@@ -48,7 +48,7 @@ token/
 |---|---|
 | `tokens.php` 缺失 / 不可读 / 语法错 / 返回值不是数组 | **503** + 自解释提示。绝不裸奔放行 |
 | `'auth' => true` 但 `tokens` 数组为空 | **503**（还没签发任何凭据） |
-| token 不匹配 / 没带 token | **403** |
+| token 不匹配 / 没带 token | **403**，正文一到两行（没带 = 「需要有效的 token」；带了但不匹配 = 「token 无效」），不含路径与命令 |
 | `'auth' => false` | 完全放行，且**不盖章**（行为与无认证版逐字节一致） |
 
 503 与 403 严格区分：**503 = 管理员配置错了**（去修 `tokens.php`），**403 = 访问者没凭据**。
@@ -58,9 +58,14 @@ token/
 ## 2. 安装
 
 ```sh
-# 全新安装（Debian / Ubuntu / Alpine）
-curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/token/token/install.sh | MYTV_REF=token sh
+# 现在（token 分支尚未合并进 main）
+curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/token/token/install.sh | sh
+
+# 合并进 main 之后：同一个脚本，路径换成 main（MYTV_REF 仍然不用指定）
+curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/token/install.sh | sh
 ```
+
+**不需要 `MYTV_REF=token`**：脚本默认开启 token 认证（`MYTV_TOKEN=0` 才退回无认证）。
 
 装完会**只打印一次**明文 token，请立刻保存。之后：
 
@@ -72,15 +77,71 @@ curl -i 'http://<服务器IP>/mytv.php?p=m3u&token=<你的token>'
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MYTV_REF` | `token` | 拉取的文件版本。建议固定到 tag/commit 以保证可复现 |
+| `MYTV_REF` | `main` | **首选** ref（分支 / tag / commit）。脚本按 `$MYTV_REF → main → token` 探测哪个 ref 下有 `token/mytv.php`，用第一个命中的（实际版本会打进横幅）。详见下面的「合并进 main 之后」 |
 | `MYTV_SKIP_BASE` | 空 | 设为 `1` 跳过阶段 1（基础环境已装好的机器） |
 | `MYTV_TOKEN` | `1` | 设为 `0` 只做阶段 1 = 等价主脚本，站点无认证（应急退路） |
 | `SHA_MYTV_PHP` | 空 | `token/mytv.php` 的 sha256，设置后强制校验 |
 
+### 合并进 main 之后
+
+**脚本不用改，也不用再记 `MYTV_REF`。** ref 是自动解析的：
+
+| 状态 | `token/mytv.php` 在哪 | 结果 |
+|---|---|---|
+| 合并**前**（当前） | 只在 `token` 分支 | 首选 `main` 探测失败 → 自动回退 `token`，横幅提示"已改用 token" |
+| 合并**后** | `main` 里也有 | 直接用 `main`（首选即命中，不再回退） |
+| 合并后**又删掉** `token` 分支 | 只剩 `main` | 仍然用 `main`，不受影响 |
+| 固定到 tag / commit | 看该版本 | `MYTV_REF=v1.2.3` 命中即用，部署结果可复现 |
+
+注意两点：
+
+- 阶段 1 委托的 `php/install.sh` **也用同一个解析结果**去拉文件，两个阶段不会各拉各的版本；
+- 本方案**不改 `php/install.sh`**（它保持无认证版）：token 认证只在 `token/install.sh` 这一层默认开启。
+  所以合并进 main 之后，`main/token/install.sh` 是 token 版入口，`main/php/install.sh` 仍是原来的无认证版入口。
+
+### 依赖与用到的全部文件
+
+脚本**不引入任何新依赖**，只用主安装器本来就要装的东西。手工部署时照着下面准备即可。
+
+**仓库里被用到的文件**
+
+| 文件 | 谁用 | 必需 | 用途 |
+|---|---|---|---|
+| `token/mytv.php` | 阶段 2 | ✅ | 应用文件本体 → `/var/www/html/mytv.php`（与仓库逐字节一致） |
+| `token/install.sh` | 你 | ✅ | 一键入口：合并前 `.../token/token/install.sh`，合并后 `.../main/token/install.sh` |
+| `php/install.sh` | 阶段 1 | ✅ | 主安装器：装包、写 `/etc/nginx/mytv-fpm.conf`、装站点配置、部署 `php/mytv.php`+`php/sub.php`、自检 |
+| `nginx/debian/php-site.conf` | 阶段 1（Debian/Ubuntu） | ✅ | 站点配置 → `/etc/nginx/conf.d/php-site.conf` |
+| `nginx/alpine/php-site.conf` | 阶段 1（Alpine） | ✅ | 站点配置 → `/etc/nginx/http.d/php-site.conf` |
+| `php/mytv.php`、`php/sub.php` | 阶段 1 | ✅ | 基线应用文件；阶段 2 覆盖 `mytv.php`、删除 `sub.php`（`MYTV_TOKEN=0` 时保留） |
+| `nginx/alpine/nginx.conf`、`nginx/debian/php-site-manual.conf` | — | ⭕ | 可选：Alpine 的 nginx 主配置、手工部署用的内联站点配置 |
+| `nginx/nginx.conf`、`nginx/notoken/nginx.conf`、`nginx/token/auth_tokens.example.conf` | — | ❌ | 反代版 / 历史遗留，PHP 版用不到（见第 10 节） |
+| `docs/plans/01-auth-token.md` | — | ❌ | 设计文档，运行时不需要 |
+
+**系统依赖（全部由阶段 1 的主安装器安装，本脚本自己不装包）**
+
+| 系统 | 包 |
+|---|---|
+| Debian / Ubuntu | `nginx`、`curl`、`php-fpm`（优先 `php8.4-fpm`）、`php-curl` |
+| Alpine | `nginx`、`php`、`php-fpm`、`php-curl`、`curl` |
+
+- **不需要**：数据库、composer、node、redis、cron、`openssl` 命令行（token 用内核 UUID / `/dev/urandom` 生成）
+- **不需要 mbstring**：过滤用 `stripos`（二进制安全、中文正确），已在 Alpine php 8.3（`mbstring=0`）上验证
+- **需要 PHP ≥ 7.0**：代码只用 `??` 与 `catch (\Throwable)`
+- 运行前 `curl` 必须在（安装命令本身就是 `curl | sh`）；缺失时会明确报错
+
+**部署产物（服务器上只多这两个）**
+
+| 路径 | 属主 / 权限 | 说明 |
+|---|---|---|
+| `/var/www/html/mytv.php` | `root:root 0644` | 应用文件，与仓库逐字节一致（可 sha256 比对） |
+| `/etc/mytv/tokens.php` | `root:<php-fpm 组> 0640`，目录 `0710` | 凭据表，只存 sha256 哈希 |
+
+其余都是主安装器本来就有的：`/etc/nginx/conf.d/php-site.conf`（Alpine 为 `/etc/nginx/http.d/php-site.conf`）、`/etc/nginx/mytv-fpm.conf`。
+
 ### 回退到无认证版
 
 ```sh
-MYTV_REF=main sh -c "$(curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/php/install.sh)"
+curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/php/install.sh | sh
 ```
 
 `/etc/mytv/tokens.php` 留着无害（回退后没人再读它）。
@@ -235,13 +296,23 @@ curl -s -o /dev/null -w '%{http_code}\n' 'http://<服务器>/mytv.php?token=<你
 curl -s 'http://<服务器>/mytv.php?p=m3u&token=<你的token>' | head -3                    # 期望看到 #EXTM3U
 ```
 
+403 的正文只是"没带 token"或"token 无效"一句话（不暴露路径、不给命令），所以排查一律照第 8 节来。
+
+⚠️ 三条都必须加引号。URL 里的 `&` 在 shell 中是**后台执行符**，不加引号时
+`curl http://h/mytv.php?p=m3u&token=x` 会在 `&` 处断成两条命令：实际发出去的请求只有
+`?p=m3u`（没有 token，必然 403），后半截 `token=x` 变成一条赋值语句——表现就是敲回车后
+直接冒出 `[1]+ Done`。**token 已经配好了却一直 403，九成是这个原因。**
+
+浏览器地址栏不需要引号（那里 `&` 只是普通字符），所以复制的链接直接贴进浏览器即可。
+
 ---
 
 ## 8. 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|
-| 所有请求 **403** | 哈希粘错、或 token 大小写不符。`printf '%s' '你的token' \| sha256sum` 重新对一遍 |
+| 带了 token 仍 **403**，且出现 `[1]+ Done` | shell 吃掉了 `&`：链接没加引号（见第 7 节）。请求里其实没有 token，服务器只能按「没带」答复（正文第一行是 `403 未授权：需要有效的 token。`） |
+| 所有请求 **403** | 看正文第一行：`需要有效的 token` = 请求里没带（多半是引号问题，见上）；`token 无效` = 带了但哈希对不上——`printf '%s' '你的token' \| sha256sum` 重新对一遍（大小写敏感），也可能是刚改完 `tokens.php` 不到 2 秒（opcache）。**403 正文只给这两句，不显示路径和命令**（避免把服务器信息回给访问者）；要排查照本节和 503 的提示做 |
 | 整站 **503** | `tokens.php` 缺失/权限不对/有语法错误/数组为空。`ls -l /etc/mytv/tokens.php`（应 0640 root:<php-fpm组>）、`ls -ld /etc/mytv`（应 0710），再用 `php -r 'var_dump(include "/etc/mytv/tokens.php");'` 看输出。若配了 `open_basedir`，需要包含 `/etc/mytv` |
 | playlist 里**没有** `token=` | `'auth'` 是 `false`（那是完全放行模式）；或者你改了 `mytv.php` 但没同步 |
 | 频道能播但 **EPG 空** | 头部 `url-tvg` 未盖章——确认用的是本版本的 `mytv.php` |

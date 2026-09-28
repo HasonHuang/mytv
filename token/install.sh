@@ -11,8 +11,13 @@ set -e
 #           生成 /etc/mytv/tokens.php（稳定 token 数组），并做 token 感知自检
 #
 # 可选环境变量：
-#   MYTV_REF        拉取的文件版本（分支 / 标签 / commit），默认 token。
-#                   建议固定到 tag 或 commit 以保证部署结果可复现。
+#   MYTV_REF        首选的文件版本（分支 / 标签 / commit），默认 main。
+#                   脚本会按「$MYTV_REF → main → token」探测哪个 ref 下真的有
+#                   token/mytv.php，用第一个命中的，因此：
+#                     · 合并进 main 之前：自动落到 token 分支
+#                     · 合并进 main 之后（哪怕 token 分支已删除）：直接用 main
+#                     · 固定到 tag / commit：命中即用，保证部署可复现
+#                   想锁定某个版本就设成 tag 或 commit。
 #   MYTV_SKIP_BASE  设为 1 时跳过阶段 1（基础环境已由主脚本装好的机器）
 #   MYTV_TOKEN      设为 0 时只做阶段 1（等价主脚本，站点无认证）。
 #                   这是 token/mytv.php 拉不到时的应急退路。
@@ -20,8 +25,9 @@ set -e
 #                   注意：token 版部署的文件与仓库文件逐字节一致，所以这个
 #                   校验覆盖的是最终产物（主安装器那边因为配置写进源码而做不到）。
 #
-# 回退到无认证版：
-#   MYTV_REF=main sh php/install.sh   # 覆盖回原版并恢复 sub.php
+# 回退到无认证版：跑主安装器，它会覆盖回原版并恢复 sub.php
+#   curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/php/install.sh | sh
+#   （/etc/mytv/tokens.php 留着无害，回退后没人再读它）
 #   （/etc/mytv/tokens.php 留着无害，不会再被读取）
 #
 # 设计文档：docs/plans/01-auth-token.md
@@ -51,10 +57,12 @@ case "$OS" in
 esac
 
 # ========== 可配置项 ==========
-MYTV_REF="${MYTV_REF:-token}"
-REPO_RAW="https://raw.githubusercontent.com/HasonHuang/mytv/${MYTV_REF}"
-MYTV_PHP_URL="${REPO_RAW}/token/mytv.php"
-BASE_INSTALL_URL="${REPO_RAW}/php/install.sh"
+# MYTV_REF 只是「首选 ref」，最终用哪个由下面的 resolve_ref() 探测决定。
+# 默认值不写死分支名：写死的话，token 分支合并进 main（并删除）之后，
+# 这个脚本的第一步就会 404 —— 而不是"自动跟着 main 走"。
+MYTV_REF="${MYTV_REF:-main}"
+MYTV_REF_CANDIDATES="$MYTV_REF main token"
+GITHUB_RAW="https://raw.githubusercontent.com/HasonHuang/mytv"
 
 MYTV_SKIP_BASE="${MYTV_SKIP_BASE:-}"
 MYTV_TOKEN="${MYTV_TOKEN:-1}"
@@ -74,10 +82,50 @@ NEW_TOKEN=""
 echo "========================================="
 echo "   🔐 mytv token 版安装"
 echo "   💻 检测到系统: ${OS}"
-echo "   🏷️  文件版本: ${MYTV_REF}"
+echo "   🏷️  首选版本: ${MYTV_REF}"
 echo "========================================="
 
+# 探测哪个 ref 下真的有 token/mytv.php，输出第一个命中的 ref 名。
+# 顺序：首选 ref → main → token。404 就试下一个；网络类失败也落到下一个，
+# 全部失败才返回非零，由调用方报错（报错信息里会列出试过哪些 ref）。
+resolve_ref() {
+    for ref in $MYTV_REF_CANDIDATES; do
+        # 2>/dev/null：候选 ref 未命中时 curl 会往 stderr 吐一行 (22) 404，
+        # 那是预期内的探测过程，不该吓到用户
+        if curl -fsS --connect-timeout 10 --max-time 60 -o /dev/null \
+                "$GITHUB_RAW/$ref/token/mytv.php" 2>/dev/null; then
+            printf '%s' "$ref"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 解析实际使用的 ref。必须在阶段 1 之前完成：阶段 1 委托的主安装器
+# （php/install.sh）也要从同一个 ref 拉文件，两个阶段不能各拉各的。
+if ! command -v curl >/dev/null 2>&1; then
+    echo "❌ 需要 curl：本脚本用它拉取仓库文件（安装命令本身就是 curl | sh，正常不会缺）。"
+    exit 1
+fi
+echo
+echo "🔍 解析文件版本..."
+if ! RESOLVED_REF=$(resolve_ref); then
+    echo "❌ 以下 ref 下都找不到 token/mytv.php：$MYTV_REF_CANDIDATES" >&2
+    echo "   请确认仓库地址（当前为 $GITHUB_RAW）与分支/标签名，且已推送到 GitHub。" >&2
+    exit 1
+fi
+if [ "$RESOLVED_REF" != "$MYTV_REF" ]; then
+    echo "⚠️ 首选 ref '$MYTV_REF' 下没有 token/mytv.php，已改用 '$RESOLVED_REF'。"
+    echo "   （token 分支合并进 main 之后属正常现象；分支被删时同样如此。）"
+fi
+echo "✅ 文件版本: $RESOLVED_REF"
+
+REPO_RAW="$GITHUB_RAW/$RESOLVED_REF"
+MYTV_PHP_URL="${REPO_RAW}/token/mytv.php"
+BASE_INSTALL_URL="${REPO_RAW}/php/install.sh"
+
 # ========== 通用函数 ==========
+
 
 # 下载文件（带重试、非空校验、<?php 头校验、可选 sha256），先写临时文件再原子替换
 # fetch <url> <目标文件> <sha256|空>
@@ -211,7 +259,7 @@ else
     # ⚠️ 它会部署"无认证"的 mytv.php 并期望裸访问返回 200，所以重跑本脚本时会有一个
     #    短暂的无认证窗口，阶段 2 随后覆盖。幂等重跑通常发生在维护窗口，可接受。
     curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 300 "$BASE_INSTALL_URL" \
-        | MYTV_REF="$MYTV_REF" sh || {
+        | MYTV_REF="$RESOLVED_REF" sh || {
         # 主安装器的最后一步自检要求「裸访问 = 200」，而 token 版站点裸访问是 403；
         # 叠加 opcache 的 revalidate_freq（默认 2s）——重跑时它可能仍在执行刚被覆盖掉的
         # token 版脚本，于是读成 403 判定"站点不可访问"并 exit 1。
@@ -416,14 +464,19 @@ if [ -n "$NEW_TOKEN" ]; then
     echo "      请立刻保存到密码管理器。"
 fi
 echo
-echo "📁 应用: $WEB_DIR/mytv.php（root:root 0644，与仓库文件逐字节一致，可 sha256 比对）"
+echo "📁 应用: $WEB_DIR/mytv.php（root:root 0644，取自 $RESOLVED_REF，与仓库文件逐字节一致，可 sha256 比对）"
 echo "🔧 凭据: $TOKENS_FILE（加人/封人都改这里）"
 echo
-echo "用法示例："
+echo "用法示例（浏览器地址栏直接粘）："
 echo "  整份订阅:  http://<服务器IP>/mytv.php?p=m3u&token=<你的token>"
 echo "  只留两台:  http://<服务器IP>/mytv.php?p=m3u&filter=翡翠台,凤凰中文&token=<你的token>"
 echo "  代理订阅:  http://<服务器IP>/mytv.php?sub=<编码后的上游m3u地址>&token=<你的token>"
 echo "            （filter 也可用；关键字按节目名子串匹配，大小写不敏感，英文逗号分隔）"
+echo
+echo "命令行自检（⚠️ 链接必须用引号包住，否则 & 会被 shell 当成后台执行符、命令从 & 处截断，"
+echo "              token 根本传不到服务器，还会看到 [1]+ Done）："
+echo "        curl -i 'http://127.0.0.1/mytv.php?p=m3u&token=<你的token>'   # 期望 200"
+echo "        curl -i 'http://127.0.0.1/mytv.php?p=m3u'                    # 期望 403"
 echo
 echo "加一枚 token："
 echo "        printf '%s' '你的新token' | sha256sum"
@@ -431,7 +484,7 @@ echo "      把输出的哈希粘进 $TOKENS_FILE 的 tokens 数组（值随便�
 echo "封一枚 token：删掉对应那一行即可，立即生效（opcache 默认 2s 内）"
 echo
 echo "回退到无认证版："
-echo "        MYTV_REF=main sh php/install.sh"
+echo "        curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/php/install.sh | sh"
 echo
 echo "⚠️ 强烈建议：打开 $SITE_CONF 里注释掉的 limit_req"
 echo "   （默认开启认证后，所有扫描请求都会打到 PHP 进程，而不是被 nginx 直接挡掉）。"

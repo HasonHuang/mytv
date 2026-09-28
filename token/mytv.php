@@ -150,11 +150,16 @@ if (!function_exists('mytv_token_ok')) {
 }
 
 if (!function_exists('mytv_deny')) {
-    function mytv_deny() {
+    /** 403：只说结果，不夹带命令、路径与 token 回显。 */
+    function mytv_deny($tok_given) {
         http_response_code(403);
         header('Content-Type: text/plain; charset=utf-8');
-        echo "403 未授权：需要有效的 token。\n";
-        echo "请在链接后追加 token 参数，例如 ...?p=m3u&token=<你的token>（已有 ? 参数时用 & 连接）。\n";
+        if (is_string($tok_given) && $tok_given !== '') {
+            echo "403 未授权：token 无效。\n";
+        } else {
+            echo "403 未授权：需要有效的 token。\n";
+            echo "请在链接后追加 token 参数（已有 ? 参数时用 & 连接）。\n";
+        }
         exit;
     }
 }
@@ -166,8 +171,10 @@ if (!function_exists('mytv_require_token')) {
      */
     function mytv_require_token() {
         mytv_misconfigured();
-        if (mytv_auth_on() && !mytv_token_ok(isset($_GET['token']) ? $_GET['token'] : '')) {
-            mytv_deny();
+        // ?token[]=x 会给到数组：非字符串一律当成"没带"，省得下游拿到数组
+        $tok = (isset($_GET['token']) && is_string($_GET['token'])) ? $_GET['token'] : '';
+        if (mytv_auth_on() && !mytv_token_ok($tok)) {
+            mytv_deny($tok);
         }
     }
 }
@@ -610,7 +617,7 @@ $p = $_GET['p'] ?? '';
 // [mytv-token] token 版新增的入参
 $SUB    = isset($_GET['sub']) ? $_GET['sub'] : '';
 $FILTER = isset($_GET['filter']) ? $_GET['filter'] : '';
-$TOKEN  = isset($_GET['token']) ? $_GET['token'] : '';
+$TOKEN  = (isset($_GET['token']) && is_string($_GET['token'])) ? $_GET['token'] : '';
 $kws    = mytv_filter_keywords($FILTER);
 
 // [mytv-token] 本站入口标识。$ENTRY_PATH 是盖章与 hostsub 的判据，必须精确到脚本本身。
@@ -707,7 +714,9 @@ if ($SUB !== '') {
     $sub_scheme = parse_url($SUB, PHP_URL_SCHEME);
     if ($sub_scheme !== 'http' && $sub_scheme !== 'https') {
         header("HTTP/1.1 400 Bad Request");
-        die("错误：sub 必须是完整的 http(s) 地址。用法: mytv.php?sub=<编码后的URL>&token=<你的token>");
+        die("错误：sub 必须是完整的 http(s) 地址。\n"
+            . "用法: /mytv.php?sub=<编码后的URL>&token=<你的token>（命令行里整条链接要加引号，\n"
+            . "否则 & 会被 shell 当成后台执行符、命令从 & 处截断）");
     }
 
     $sub_host      = mytv_url_host($SUB);
