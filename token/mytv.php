@@ -217,13 +217,33 @@ if (!function_exists('mytv_stamp')) {
      * 盖上「请求者自己那枚」token。
      * auth 关闭时原样返回：无认证版的行为必须逐字节保持不变，不能平白多出 token 参数。
      * 盖章前先剥旧值，既防重复盖章，也防沿用上游或旧 playlist 里已吊销的 token。
+     *
+     * token 一律放在**第一个**查询参数位：mytv.php?token=T&url=<目标URL>。
+     * 排在尾部（…?url=<目标URL>&token=T）时目标 URL 自带查询串就被读成"我们的参数"，
+     * 反过来尾部的 token 也容易被当成目标 URL 的参数——播放器与人都分不清
+     * "这是本站入口的凭据"还是"上游源站的 token"。放最前面则一眼可辨。
      */
     function mytv_stamp($url, $tok) {
         if (!mytv_auth_on() || !is_string($tok) || $tok === '') {
             return $url;
         }
         $u = mytv_strip_token($url);
-        return $u . (strpos($u, '?') === false ? '?' : '&') . 'token=' . rawurlencode($tok);
+
+        // 先摘掉 fragment，token 参数必须插在 ? 之后、# 之前
+        $frag = '';
+        $hash = strpos($u, '#');
+        if ($hash !== false) {
+            $frag = substr($u, $hash);
+            $u    = substr($u, 0, $hash);
+        }
+
+        $stamp = 'token=' . rawurlencode($tok);
+        $q     = strpos($u, '?');
+        if ($q === false) {
+            return $u . '?' . $stamp . $frag;
+        }
+        $rest = substr($u, $q + 1);
+        return substr($u, 0, $q) . '?' . $stamp . ($rest === '' ? '' : '&' . $rest) . $frag;
     }
 }
 
@@ -715,7 +735,7 @@ if ($SUB !== '') {
     if ($sub_scheme !== 'http' && $sub_scheme !== 'https') {
         header("HTTP/1.1 400 Bad Request");
         die("错误：sub 必须是完整的 http(s) 地址。\n"
-            . "用法: /mytv.php?sub=<编码后的URL>&token=<你的token>（命令行里整条链接要加引号，\n"
+            . "用法: /mytv.php?token=<你的token>&sub=<编码后的URL>（命令行里整条链接要加引号，\n"
             . "否则 & 会被 shell 当成后台执行符、命令从 & 处截断）");
     }
 
@@ -1049,7 +1069,12 @@ if ($is_m3u8) {
                     // 里可能烙着已吊销的旧 token，必须剥旧盖新，否则二次分发后立刻 403。
                     // 只给自有链接盖章：别站的 mytv.php?url= 代理链接不需要我们的 token
                     // 也能用，给它盖章等于把凭据写进第三方服务器的访问日志。
-                    if (strpos($uri, 'mytv.php?url=') !== false) {
+                    //
+                    // 判据用 mytv_is_proxy_link 而不是字面量 'mytv.php?url='：
+                    // 本版盖章后是 mytv.php?token=…&url=…，token 在前面，字面量匹配不到，
+                    // 自己发出去的链接回灌进来就会被当成普通相对路径、拼出坏链接。
+                    $proxied = null;
+                    if (mytv_is_proxy_link($uri, $proxied)) {
                         return 'URI="' . mytv_stamp_own($uri, $stamp_opts) . '"';
                     }
 
@@ -1077,8 +1102,9 @@ if ($is_m3u8) {
             continue;
         }
 
-        // 已代理的不重复处理
-        if (strpos($line, 'mytv.php?url=') !== false) {
+        // 已代理的不重复处理（判据同盖章②：不能写字面量 'mytv.php?url='）
+        $proxied = null;
+        if (mytv_is_proxy_link($line, $proxied)) {
             // [mytv-token] 出站盖章④：改成剥旧盖新（基线这里是原样返回）。
             // 同样只给自有链接盖章，理由见盖章②。
             $out[] = mytv_stamp_own($line, $stamp_opts);

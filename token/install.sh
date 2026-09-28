@@ -446,7 +446,7 @@ if [ -n "$NEW_TOKEN" ]; then
     fi
 else
     echo "ℹ️ 未能取得明文 token（$TOKENS_FILE 已存在），请用你自己的 token 访问验证："
-    echo "     curl -i 'http://127.0.0.1/mytv.php?p=m3u&token=<你的token>'"
+    echo "     curl -i 'http://127.0.0.1/mytv.php?token=<你的token>&p=m3u'"
 fi
 
 # ========== 完成 ==========
@@ -467,15 +467,15 @@ echo
 echo "📁 应用: $WEB_DIR/mytv.php（root:root 0644，取自 $RESOLVED_REF，与仓库文件逐字节一致，可 sha256 比对）"
 echo "🔧 凭据: $TOKENS_FILE（加人/封人都改这里）"
 echo
-echo "用法示例（浏览器地址栏直接粘）："
-echo "  整份订阅:  http://<服务器IP>/mytv.php?p=m3u&token=<你的token>"
-echo "  只留两台:  http://<服务器IP>/mytv.php?p=m3u&filter=翡翠台,凤凰中文&token=<你的token>"
-echo "  代理订阅:  http://<服务器IP>/mytv.php?sub=<编码后的上游m3u地址>&token=<你的token>"
+echo "用法示例（token 放最前面，浏览器地址栏直接粘）："
+echo "  整份订阅:  http://<服务器IP>/mytv.php?token=<你的token>&p=m3u"
+echo "  只留两台:  http://<服务器IP>/mytv.php?token=<你的token>&p=m3u&filter=翡翠台,凤凰中文"
+echo "  代理订阅:  http://<服务器IP>/mytv.php?token=<你的token>&sub=<编码后的上游m3u地址>"
 echo "            （filter 也可用；关键字按节目名子串匹配，大小写不敏感，英文逗号分隔）"
 echo
 echo "命令行自检（⚠️ 链接必须用引号包住，否则 & 会被 shell 当成后台执行符、命令从 & 处截断，"
 echo "              token 根本传不到服务器，还会看到 [1]+ Done）："
-echo "        curl -i 'http://127.0.0.1/mytv.php?p=m3u&token=<你的token>'   # 期望 200"
+echo "        curl -i 'http://127.0.0.1/mytv.php?token=<你的token>&p=m3u'   # 期望 200"
 echo "        curl -i 'http://127.0.0.1/mytv.php?p=m3u'                    # 期望 403"
 echo
 echo "加一枚 token："
