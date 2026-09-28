@@ -13,17 +13,13 @@
 ## 一、安装
 
 ```sh
-# token 分支合并进 main 之前
-curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/token/token/install.sh | sh
-
-# 合并进 main 之后：同一个脚本，只换路径
 curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/token/install.sh | sh
 ```
 
 脚本会装好 nginx + php-fpm、写好站点配置、部署应用、生成凭据表，并自检。
 装完会**只打印一次**明文 token，请立刻保存——服务器上只存它的 sha256 哈希，丢了只能重新生成。
 
-认证默认开启，不用指定别的变量；`MYTV_REF` 也不用管（脚本自己挑能用的版本）。
+认证默认开启，不用指定别的变量；只有想装指定版本（tag / commit）时才需要设 `MYTV_REF`。
 
 ### 环境变量（一般都用不上）
 
@@ -47,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/HasonHuang/mytv/main/token/install.
 | `/var/www/html/mytv.php` | `root:root 0644` | 应用文件，与仓库文件逐字节一致（可 sha256 比对） |
 | `/etc/mytv/tokens.php` | `root:<php-fpm组> 0640`，目录 `0710` | 凭据表，只存哈希 |
 
-完整的文件清单（用了仓库里哪些文件、手工部署怎么做）见 [NOTES.md](NOTES.md#4-依赖与用到的全部文件)。
+完整的文件清单（用了仓库里哪些文件、手工部署怎么做）见 [NOTES.md](NOTES.md#3-依赖与用到的全部文件)。
 
 ---
 
@@ -68,7 +64,7 @@ http://<服务器>/mytv.php?token=<你的token>&sub=<编码后的上游地址>
 
 把这串链接填进播放器即可。`filter` 对 `p=m3u` 和 `sub=` 都生效；一个关键字都没命中时返回空列表
 （仍是 200，不报错）。匹配规则（子串、大小写、全角逗号、上限…）见
-[NOTES.md](NOTES.md#6-filter-的完整规则)。
+[NOTES.md](NOTES.md#5-filter-的完整规则)。
 
 > ⚠️ **输出里每条链接都会被盖上你自己那枚 token**——播放器取子链接、拉 EPG 时才不会再被 403 拦住。
 > 代价是：**转发一份 playlist 等于把这枚 token 的权限交出去**，直到你从 `tokens.php` 里删掉那一行。

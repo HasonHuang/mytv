@@ -101,30 +101,15 @@ if (!empty($_GET['token'])) { $q .= '&token=' . urlencode($_GET['token']); }
 header('Location: ' . $q, true, 302);
 ```
 
----
+### 与 `php/install.sh` 的关系
 
-## 3. 合并进 main 之后（ref 自动解析）
-
-**脚本不用改，也不用再记 `MYTV_REF`。** `token/install.sh` 按 `$MYTV_REF → main → token`
-探测哪个 ref 下有 `token/mytv.php`，用第一个命中的，并把实际版本打进横幅：
-
-| 状态 | `token/mytv.php` 在哪 | 结果 |
-|---|---|---|
-| 合并**前** | 只在 `token` 分支 | 首选 `main` 探测失败 → 自动回退 `token`，横幅提示"已改用 token" |
-| 合并**后** | `main` 里也有 | 直接用 `main`（首选即命中，不再回退） |
-| 合并后**又删掉** `token` 分支 | 只剩 `main` | 仍然用 `main`，不受影响 |
-| 固定到 tag / commit | 看该版本 | `MYTV_REF=v1.2.3` 命中即用，部署结果可复现 |
-
-注意两点：
-
-- 阶段 1 委托的 `php/install.sh` **也用同一个解析结果**去拉文件，两个阶段不会各拉各的版本；
-- 本方案**不改 `php/install.sh`**（它保持无认证版）：token 认证只在 `token/install.sh` 这一层默认开启。
-  所以合并进 main 之后，`main/token/install.sh` 是 token 版入口，`main/php/install.sh`
-  仍是原来的无认证版入口。
+本方案**不改 `php/install.sh`**（它保持无认证版）：token 认证只在 `token/install.sh` 这一层默认开启。
+所以 `main/token/install.sh` 是 token 版入口，`main/php/install.sh` 仍是无认证版入口。
+拉取的文件版本由 `MYTV_REF`（默认 `main`）决定，两个阶段共用同一个值。
 
 ---
 
-## 4. 依赖与用到的全部文件
+## 3. 依赖与用到的全部文件
 
 脚本**不引入任何新依赖**，只用主安装器本来就要装的东西。手工部署时照着下面准备即可。
 
@@ -182,7 +167,7 @@ chown root:<php-fpm组> /etc/mytv/tokens.php && chmod 0640 /etc/mytv/tokens.php
 
 ---
 
-## 5. 已知问题与限制（只记录，本版不修）
+## 4. 已知问题与限制（只记录，本版不修）
 
 - **凭据永不过期，且被印进 playlist**：这是本版最大的取舍。转发 playlist = 永久交出该 token 的全部权限，
   只能靠人工删行吊销。缓解：每人/每设备一枚 + 标签、删行即时生效、README 首屏的警告。
@@ -226,7 +211,7 @@ diff /tmp/base.php token/mytv.php | grep -v 'mytv-token' | less
 
 ---
 
-## 6. `filter=` 的完整规则
+## 5. `filter=` 的完整规则
 
 | 规则 | 说明 |
 |---|---|
@@ -246,7 +231,7 @@ diff /tmp/base.php token/mytv.php | grep -v 'mytv-token' | less
 
 ---
 
-## 7. 仓库里的其它陈旧/无关内容（本版未动）
+## 6. 仓库里的其它陈旧/无关内容（本版未动）
 
 - `README.md:14` 里"请把 nginx.conf 第 69 行的 mytv123 修改为你自己的 token"——行号与内容已陈旧。
 - `README.md:172-174` 与 `php/install.sh:454` 提到的 `60s` 超时，实际配置里是 `120s`。
