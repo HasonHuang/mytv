@@ -88,7 +88,12 @@ $proxy_base = $scheme . '://' . $_SERVER['HTTP_HOST'];
 $proxy_prefix = $proxy_base . '/mytv.php?url=';
 
 // 6. 解析 m3u 内容
-$is_m3u = (stripos($response, '#EXTM3U') !== false) || preg_match('/\.m3u8?$/i', $request_url);
+// 只有上游成功（2xx）才当播放列表改写：4xx/5xx 的正文是错误提示（例如面板回
+// 401 + "unauthorized: invalid or expired token"），路径又恰好以 .m3u 结尾时，
+// 不加这道闸就会把错误提示当成"播放列表里的一行链接"包装成代理链接发出去，
+// 掩盖真正的原因。与 token/mytv.php 的 sub= 分支保持一致。
+$is_m3u = ($http_code >= 200 && $http_code < 300)
+    && ((stripos($response, '#EXTM3U') !== false) || preg_match('/\.m3u8?$/i', $request_url));
 
 if ($is_m3u) {
     $base_root = ($parsed_url['scheme'] ?? 'http') . '://' . $host . $port;

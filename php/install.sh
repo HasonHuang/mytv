@@ -106,19 +106,84 @@ fetch() {
     mv -f "$tmp" "$dest"
 }
 
+# 找 php-fpm 可执行文件。两边的命名不一样：Debian/Ubuntu 是 /usr/sbin/php-fpm8.4，
+# Alpine 是 /usr/sbin/php-fpm85（而且没有不带版本号的名字）。
+find_php_fpm_bin() {
+    for cand in \
+        "/usr/sbin/php-fpm${PHP_VERSION}" \
+        "/usr/sbin/php-fpm$(printf '%s' "$PHP_VERSION" | tr -d '.')" \
+        /usr/sbin/php-fpm /usr/local/sbin/php-fpm /usr/bin/php-fpm \
+        /usr/sbin/php-fpm[0-9]* /usr/local/sbin/php-fpm[0-9]* /usr/bin/php-fpm[0-9]*
+    do
+        if [ -x "$cand" ]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 没有 init 系统时的兜底（典型：容器）：直接把守护进程拉起来。
+# 只处理本脚本会启动的 nginx 与 php-fpm，别的服务名一律失败，不猜。
+start_daemon() {
+    svc=$1
+    echo "ℹ️ 未检测到 init 系统（容器环境），直接启动 $svc"
+    case "$svc" in
+        nginx)
+            # pid 文件默认写在 /run/nginx/nginx.pid；正常安装里这个目录由 OpenRC 的
+            # checkpath 建好，容器里没人建，缺了它 nginx 会直接起不来。
+            mkdir -p /run/nginx
+            # -g 'daemon on;'：镜像自带的 nginx.conf 常写着 daemon off;（官方 nginx
+            # 镜像就是），那样直接跑会占住前台把脚本卡死。
+            nginx -g 'daemon on;'
+            ;;
+        php-fpm|php-fpm[0-9]*|php[0-9]*-fpm)
+            bin=$(find_php_fpm_bin || true)
+            if [ -z "$bin" ]; then
+                echo "❌ 找不到 php-fpm 可执行文件。"
+                return 1
+            fi
+            # -D 强制退到后台，忽略配置文件里的 daemonize（发行版默认是 yes，
+            # 但被改成 no 的话前台启动会把脚本卡住）
+            "$bin" -D
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # 启动服务（并尽量设置开机自启），成功返回 0
 start_service() {
     svc=$1
+
+    # 1) systemd
     if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
         systemctl enable --now "$svc"
-    elif command -v rc-service >/dev/null 2>&1; then
+        return $?
+    fi
+
+    # 2) OpenRC。判据是 /run/openrc/softlevel（OpenRC 真的 boot 过），而不是
+    #    "rc-service 命令在不在"：容器里 rc-service 可能压根没装（Alpine 3.2x 起
+    #    主包不再依赖 openrc），装了也可能因为 "openrc did not boot" 必然失败。
+    #    另外得确认 init 脚本存在——同一轮拆包把 nginx 的服务脚本挪进了
+    #    nginx-openrc 子包，主包里没有 /etc/init.d/nginx。
+    if [ -e /run/openrc/softlevel ] && command -v rc-service >/dev/null 2>&1 \
+       && [ -x "/etc/init.d/$svc" ]; then
         rc-update add "$svc" default >/dev/null 2>&1 || true
         rc-service "$svc" start
-    elif command -v service >/dev/null 2>&1; then
-        service "$svc" start
-    else
-        return 1
+        return $?
     fi
+
+    # 3) sysvinit 兼容层（Debian 的 /usr/sbin/service 包装 /etc/init.d/*）。
+    #    失败不在这里判死：容器里 init.d 脚本会说 "openrc did not boot"，
+    #    继续往下走直接拉进程才是可用的那条路。
+    if command -v service >/dev/null 2>&1 && [ -x "/etc/init.d/$svc" ]; then
+        service "$svc" start && return 0
+    fi
+
+    # 4) 没有可用的 init 系统 → 直接启动守护进程
+    start_daemon "$svc"
 }
 
 # 重新加载 Nginx
@@ -361,7 +426,24 @@ setup_site() {
 
 # 通过本机请求确认站点真的可用，避免"脚本报成功、实际 502"
 verify_site() {
-    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1/mytv.php" || true)
+    curl_code() {
+        curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://127.0.0.1/mytv.php" || true
+    }
+
+    # nginx reload 是异步的：信号发出后，旧 worker 仍会用**部署前**的配置应答，
+    # 直到新 worker 接管。窗口不长（实测不到 1s，但容器上足够快过本函数），
+    # 表现就是站点配置明明刚上线，/mytv.php 却回 404（旧配置里没有这个站点），
+    # 或 000（reload 期间没有任何 worker 在听）。把这两种都当作"还没就绪"重试，
+    # 其余状态码是确定结论，直接判定。
+    code=$(curl_code)
+    retry=0
+    while [ "$retry" -lt 10 ]; do
+        case "$code" in
+            404|000|"") retry=$((retry + 1)); sleep 1; code=$(curl_code) ;;
+            *) break ;;
+        esac
+    done
+
     case "$code" in
         200)
             echo "✅ 站点自检通过 (HTTP 200)"
@@ -377,12 +459,12 @@ verify_site() {
             exit 1
             ;;
         000|"")
-            echo "❌ 无法访问 http://127.0.0.1/mytv.php。"
+            echo "❌ 无法访问 http://127.0.0.1/mytv.php（已重试 ${retry} 次）。"
             echo "   请检查 80 端口是否被占用（ss -ltnp | grep :80）、防火墙是否放行 80 端口。"
             if [ "$OS" = "alpine" ]; then
                 echo "   若你用过仓库里的 nginx/alpine/nginx.conf，请确认 /etc/nginx/nginx.conf 中"
                 echo "     include /etc/nginx/http.d/*.conf;"
-                echo "   这行没有被注释掉——仓库那份默认是注释状态，取消注释后http.d 下的"
+                echo "   这行没有被注释掉——仓库那份默认是注释状态，取消注释后 http.d 下的"
                 echo "   站点配置才会被加载（否则 nginx -t 通过但 80 端口无人监听）。"
             fi
             exit 1
@@ -505,10 +587,19 @@ install_alpine() {
     echo "[1/5] 安装 Nginx, PHP 和 基础工具..."
     apk update
     apk add --no-cache nginx php php-fpm php-curl curl
+    # Alpine 3.2x 起 nginx 的 OpenRC 服务脚本被拆进 nginx-openrc 子包，主包不再包含，
+    # 于是 `rc-service nginx start` 会报 "service does not exist"。只有真的有 OpenRC
+    # 在跑（不是容器）时才需要它；老版本 Alpine 里该包不存在，装不上也无妨——
+    # 下面的 start_service 会退到直接启动。
+    if [ -e /run/openrc/softlevel ]; then
+        apk add --no-cache nginx-openrc 2>/dev/null || true
+    fi
 
     echo "[2/5] 启动 Nginx 和 PHP-FPM..."
     if ! start_service nginx; then
-        echo "❌ 启动 Nginx 失败，请检查 80 端口是否被其它服务占用。"
+        echo "❌ 启动 Nginx 失败。常见原因："
+        echo "   · 80 端口被其它服务占用：ss -ltnp | grep :80"
+        echo "   · 配置有误：nginx -t 看报错（上面通常已有输出）"
         exit 1
     fi
     # Alpine 默认站点使用 /var/www/localhost/htdocs，且会以 default_server 抢占 80 端口
@@ -526,7 +617,9 @@ install_alpine() {
     if [ -z "$PHP_FPM_SVC" ]; then PHP_FPM_SVC="php-fpm"; fi
 
     if ! start_service "$PHP_FPM_SVC"; then
-        echo "❌ 启动 $PHP_FPM_SVC 失败，请执行 'rc-service $PHP_FPM_SVC status' 查看原因。"
+        echo "❌ 启动 $PHP_FPM_SVC 失败。"
+        echo "   有 init 系统：rc-service $PHP_FPM_SVC status"
+        echo "   容器里没有 rc-service：前台跑一次 php-fpm 看报错（如 /usr/sbin/php-fpm85 -F）"
         exit 1
     fi
 
@@ -556,6 +649,11 @@ echo "   🎉 安装完成！"
 echo "========================================="
 echo "👉 请访问 http://<你的服务器IP>/mytv.php 进行测试。"
 echo "📁 网站根目录: $WEB_DIR"
+# 容器里没有 init 系统，服务是本脚本直接拉起来的：容器重启后不会自己回来
+if [ ! -d /run/systemd/system ] && [ ! -e /run/openrc/softlevel ]; then
+    echo "⚠️ 当前环境没有 init 系统（容器）：nginx 与 php-fpm 已由本脚本直接启动，"
+    echo "   容器重启后不会自动恢复，重新跑一遍本脚本即可（它是幂等的）。"
+fi
 advise_high_mem
 if command -v ufw >/dev/null 2>&1; then
     echo "💡 若外部无法访问，请放行端口: ufw allow 80/tcp"
